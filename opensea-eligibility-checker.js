@@ -53,48 +53,20 @@ async function getAddress(privateKey) {
   return wallet.address;
 }
 
-// ─── Sign SIWE message untuk OpenSea auth ────────────────────────────────────
-async function signAndGetToken(privateKey, walletAddress, apiKey) {
-  const headers = { "Content-Type": "application/json" };
-  if (apiKey) headers["X-API-KEY"] = apiKey;
-
-  // Step 1: Minta challenge/nonce
-  const nonceRes = await fetch("https://api.opensea.io/api/v2/auth/challenge", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ address: walletAddress, chain: "ethereum" }),
+// ─── Cek eligibility wallet terhadap semua stage ─────────────────────────────
+function checkEligibility(walletAddress, stages) {
+  return stages.map((s) => {
+    const stageName = s.name ?? "Unknown Phase";
+    const allowlist = s.allowlist ?? s.allow_list ?? [];
+    if (s.is_public) return { stageName, icon: "[+]", reason: "Public phase" };
+    if (allowlist.length > 0) {
+      const found = allowlist.some(
+        (e) => (typeof e === "string" ? e : e.address).toLowerCase() === walletAddress.toLowerCase()
+      );
+      return { stageName, icon: found ? "[+]" : "[-]", reason: found ? "Eligible" : "Not eligible" };
+    }
+    return { stageName, icon: "[?]", reason: "Allowlist tidak di-expose API" };
   });
-  if (!nonceRes.ok) throw new Error(`Nonce error ${nonceRes.status}: ${await nonceRes.text()}`);
-  const { message } = await nonceRes.json();
-
-  // Step 2: Sign message
-  const { ethers } = await import("ethers");
-  const wallet = new ethers.Wallet(privateKey);
-  const signature = await wallet.signMessage(message);
-
-  // Step 3: Verify dan dapat session token
-  const verifyRes = await fetch("https://api.opensea.io/api/v2/auth/verify", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ message, signature }),
-  });
-  if (!verifyRes.ok) throw new Error(`Verify error ${verifyRes.status}: ${await verifyRes.text()}`);
-  const data = await verifyRes.json();
-  return data.token ?? data.access_token ?? null;
-}
-
-// ─── Cek eligibility dengan session token ────────────────────────────────────
-async function checkEligibilityAuth(slug, walletAddress, token, apiKey) {
-  const headers = { "Content-Type": "application/json" };
-  if (apiKey) headers["X-API-KEY"] = apiKey;
-  if (token) headers["Authorization"] = `Bearer ${token}`;
-
-  const res = await fetch(
-    `https://api.opensea.io/api/v2/drops/${slug}/eligibility?wallet_address=${walletAddress}`,
-    { headers }
-  );
-  if (!res.ok) return null;
-  return res.json();
 }
 
 // ─── Fetch drop info ──────────────────────────────────────────────────────────
@@ -217,53 +189,8 @@ async function main() {
 
     console.log(`\n[@] ${label} | ${walletAddress}`);
 
-    // Sign + get token
-    let token = null;
-    try {
-      process.stdout.write(`    [~] Signing ...`);
-      token = await signAndGetToken(privKey, walletAddress, env.apiKey);
-      process.stdout.write(`\r    [+] Signing OK\n`);
-    } catch (e) {
-      process.stdout.write(`\r    [!] Signing gagal: ${e.message}\n`);
-    }
-
-    // Cek eligibility dengan token
-    let eligData = null;
-    if (token) {
-      try {
-        eligData = await checkEligibilityAuth(slug, walletAddress, token, env.apiKey);
-      } catch { /* fallback */ }
-    }
-
-    if (eligData?.stages && eligData.stages.length > 0) {
-      eligData.stages.forEach((es, i) => {
-        const stageName = stages[i]?.name ?? es.stage_name ?? `Phase ${i + 1}`;
-        const eligible = es.eligible ?? es.is_eligible;
-        const icon = eligible ? "[+]" : "[-]";
-        const reason = es.reason ?? (eligible ? "Eligible" : "Not eligible");
-        console.log(`    ${icon} ${stageName}: ${reason}`);
-      });
-    } else {
-      // Fallback: cek allowlist dari drop data
-      stages.forEach((s) => {
-        const stageName = s.name ?? "Unknown Phase";
-        const allowlist = s.allowlist ?? s.allow_list ?? [];
-        let icon, reason;
-
-        if (s.is_public) {
-          icon = "[+]"; reason = "Public phase";
-        } else if (allowlist.length > 0) {
-          const found = allowlist.some(
-            (e) => (typeof e === "string" ? e : e.address).toLowerCase() === walletAddress.toLowerCase()
-          );
-          icon = found ? "[+]" : "[-]";
-          reason = found ? "Eligible" : "Not eligible";
-        } else {
-          icon = "[?]"; reason = "Allowlist tidak di-expose API";
-        }
-        console.log(`    ${icon} ${stageName}: ${reason}`);
-      });
-    }
+    const results = checkEligibility(walletAddress, stages);
+    results.forEach((r) => console.log(`    ${r.icon} ${r.stageName}: ${r.reason}`));
   }
 
   console.log(`\n[@] ${inputUrl.replace("/overview", "")}`);
