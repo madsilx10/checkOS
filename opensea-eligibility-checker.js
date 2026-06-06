@@ -2,260 +2,275 @@
 
 /**
  * OpenSea Drop Eligibility Checker
- * Usage: node opensea-eligibility-checker.js <opensea_url>
+ * Usage: npm start
  *
- * Config via .env:
- *   OPENSEA_API_KEY=your_key_here   <- opsional, bisa dihapus/dikosongkan
+ * .env format:
+ *   OPENSEA_API_KEY=your_key_here     <- opsional
+ *   CHAIN=ethereum                    <- default: ethereum
+ *   RPC_ethereum=https://eth.llamarpc.com
+ *   RPC_base=https://base.llamarpc.com
  *
- *   0xWallet1
- *   0xWallet2
- *   0xWallet3
+ *   PK_FIRST=0xprivkey...
+ *   PK_1=0xprivkey...
+ *   PK_2=0xprivkey...
  */
 
 import { readFileSync } from "fs";
 import { resolve } from "path";
+import { createInterface } from "readline";
 
-const isValidWallet = (a) => /^0x[0-9a-fA-F]{40}$/.test(a);
-
-// ─── Load .env — wallets = baris yg dimulai 0x, key = OPENSEA_API_KEY=... ────
+// ─── Load .env ────────────────────────────────────────────────────────────────
 function loadEnv() {
-  const result = { apiKey: "", wallets: [] };
+  const result = { apiKey: "", chain: "ethereum", rpcs: {}, privateKeys: [] };
   try {
     const lines = readFileSync(resolve(process.cwd(), ".env"), "utf8").split("\n");
     for (const line of lines) {
       const t = line.trim();
       if (!t || t.startsWith("#")) continue;
-      if (isValidWallet(t)) { result.wallets.push(t); continue; }
       const eq = t.indexOf("=");
       if (eq === -1) continue;
       const key = t.slice(0, eq).trim();
       const val = t.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
       if (key === "OPENSEA_API_KEY") result.apiKey = val;
+      else if (key === "CHAIN") result.chain = val.toLowerCase();
+      else if (key.startsWith("RPC_")) result.rpcs[key.slice(4).toLowerCase()] = val;
+      else if (key === "PK_FIRST" || key.startsWith("PK_")) result.privateKeys.push({ label: key, key: val });
     }
   } catch { /* .env not found */ }
   return result;
 }
 
-const OPENSEA_API_BASE = "https://api.opensea.io/api/v2";
+// ─── Prompt input ─────────────────────────────────────────────────────────────
+function prompt(question) {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((res) => rl.question(question, (ans) => { rl.close(); res(ans.trim()); }));
+}
 
-// ─── Helper: extract collection slug from OpenSea URL ───────────────────────
+// ─── Derive wallet address dari private key ───────────────────────────────────
+async function getAddress(privateKey) {
+  const { ethers } = await import("ethers");
+  const wallet = new ethers.Wallet(privateKey);
+  return wallet.address;
+}
+
+// ─── Sign SIWE message untuk OpenSea auth ────────────────────────────────────
+async function signAndGetToken(privateKey, walletAddress, apiKey) {
+  const headers = { "Content-Type": "application/json" };
+  if (apiKey) headers["X-API-KEY"] = apiKey;
+
+  // Step 1: Minta challenge/nonce
+  const nonceRes = await fetch("https://api.opensea.io/api/v2/auth/challenge", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ address: walletAddress, chain: "ethereum" }),
+  });
+  if (!nonceRes.ok) throw new Error(`Nonce error ${nonceRes.status}: ${await nonceRes.text()}`);
+  const { message } = await nonceRes.json();
+
+  // Step 2: Sign message
+  const { ethers } = await import("ethers");
+  const wallet = new ethers.Wallet(privateKey);
+  const signature = await wallet.signMessage(message);
+
+  // Step 3: Verify dan dapat session token
+  const verifyRes = await fetch("https://api.opensea.io/api/v2/auth/verify", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ message, signature }),
+  });
+  if (!verifyRes.ok) throw new Error(`Verify error ${verifyRes.status}: ${await verifyRes.text()}`);
+  const data = await verifyRes.json();
+  return data.token ?? data.access_token ?? null;
+}
+
+// ─── Cek eligibility dengan session token ────────────────────────────────────
+async function checkEligibilityAuth(slug, walletAddress, token, apiKey) {
+  const headers = { "Content-Type": "application/json" };
+  if (apiKey) headers["X-API-KEY"] = apiKey;
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  const res = await fetch(
+    `https://api.opensea.io/api/v2/drops/${slug}/eligibility?wallet_address=${walletAddress}`,
+    { headers }
+  );
+  if (!res.ok) return null;
+  return res.json();
+}
+
+// ─── Fetch drop info ──────────────────────────────────────────────────────────
+async function fetchDrop(slug, apiKey) {
+  const headers = { "Content-Type": "application/json" };
+  if (apiKey) headers["X-API-KEY"] = apiKey;
+  const res = await fetch(`https://api.opensea.io/api/v2/drops/${slug}`, { headers });
+  if (!res.ok) throw new Error(`OpenSea API ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+// ─── Extract slug dari URL ────────────────────────────────────────────────────
 function extractSlug(url) {
   try {
-    const u = new URL(url);
-    const parts = u.pathname.split("/").filter(Boolean);
-    const collectionIndex = parts.indexOf("collection");
-    if (collectionIndex !== -1 && parts[collectionIndex + 1]) {
-      return parts[collectionIndex + 1];
-    }
-    throw new Error("Could not find 'collection' in URL path");
+    const parts = new URL(url).pathname.split("/").filter(Boolean);
+    const idx = parts.indexOf("collection");
+    if (idx !== -1 && parts[idx + 1]) return parts[idx + 1];
+    throw new Error("Tidak ketemu 'collection' di URL");
   } catch (e) {
-    throw new Error(`Invalid OpenSea URL: ${e.message}`);
+    throw new Error(`URL tidak valid: ${e.message}`);
   }
 }
 
-// ─── Helper: format ETH price from wei string ───────────────────────────────
-function formatPrice(priceObj) {
-  if (!priceObj) return "FREE";
-  const value = priceObj.value ?? priceObj.amount ?? 0;
-  const decimals = priceObj.decimals ?? 18;
-  const eth = Number(BigInt(value)) / Math.pow(10, decimals);
-  if (eth === 0) return "FREE (0 ETH)";
-  return `${eth} ETH`;
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function formatPrice(p) {
+  if (!p) return "FREE";
+  const eth = Number(BigInt(p.value ?? p.amount ?? 0)) / Math.pow(10, p.decimals ?? 18);
+  return eth === 0 ? "FREE" : `${eth} ETH`;
 }
-
-// ─── Helper: format date ────────────────────────────────────────────────────
-function formatDate(isoString) {
-  if (!isoString) return "TBA";
-  return new Date(isoString).toLocaleString();
+function formatDate(iso) {
+  if (!iso) return "TBA";
+  return new Date(iso).toLocaleString("id-ID");
 }
-
-// ─── Helper: stage status ────────────────────────────────────────────────────
-function stageStatus(stage) {
+function stageStatus(s) {
   const now = Date.now();
-  const start = stage.start_time ? new Date(stage.start_time).getTime() : null;
-  const end = stage.end_time ? new Date(stage.end_time).getTime() : null;
+  const start = s.start_time ? new Date(s.start_time).getTime() : null;
+  const end = s.end_time ? new Date(s.end_time).getTime() : null;
   if (start && now < start) return "UPCOMING";
   if (end && now > end) return "ENDED";
   return "ACTIVE";
 }
-
-// ─── Helper: countdown string ───────────────────────────────────────────────
-function countdown(isoString) {
-  const diff = new Date(isoString).getTime() - Date.now();
+function countdown(iso) {
+  const diff = new Date(iso).getTime() - Date.now();
   if (diff <= 0) return "now";
   const d = Math.floor(diff / 86400000);
   const h = Math.floor((diff % 86400000) / 3600000);
   const m = Math.floor((diff % 3600000) / 60000);
-  const parts = [];
-  if (d > 0) parts.push(`${d}d`);
-  if (h > 0) parts.push(`${h}h`);
-  if (m > 0) parts.push(`${m}m`);
-  return parts.join(" ") || "<1m";
+  return [d && `${d}d`, h && `${h}h`, m && `${m}m`].filter(Boolean).join(" ") || "<1m";
 }
+function shortAddr(a) { return `${a.slice(0, 6)}...${a.slice(-4)}`; }
 
-// ─── Fetch drop details from OpenSea API ────────────────────────────────────
-async function fetchDrop(slug, apiKey) {
-  const url = `${OPENSEA_API_BASE}/drops/${slug}`;
-  const headers = { "Content-Type": "application/json" };
-  if (apiKey) headers["X-API-KEY"] = apiKey;
+// ─── Main ─────────────────────────────────────────────────────────────────────
+async function main() {
+  const env = loadEnv();
+  const LINE = "═".repeat(62);
 
-  const res = await fetch(url, { headers });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`OpenSea API error ${res.status}: ${text}`);
+  if (env.privateKeys.length === 0) {
+    console.error("[@] Tidak ada private key di .env");
+    console.error("    Format: PK_FIRST=0x... atau PK_1=0x...");
+    process.exit(1);
   }
-  return res.json();
-}
 
-// ─── Check eligibility for one wallet across all stages ─────────────────────
-function checkWalletEligibility(walletAddress, stages) {
-  return stages.map((stage, i) => {
-    const status = stageStatus(stage);
-    const allowlist = stage.allowlist ?? stage.allow_list ?? [];
-    let eligible = null;
-    let reason = "";
+  // Input URL interaktif
+  const inputUrl = await prompt("\n[?] Masukkan OpenSea collection URL: ");
+  if (!inputUrl) { console.error("[!] URL tidak boleh kosong"); process.exit(1); }
 
-    if (stage.is_public) {
-      eligible = true;
-      reason = "Public phase — anyone can mint";
-    } else if (allowlist.length > 0) {
-      const found = allowlist.some(
-        (e) => (typeof e === "string" ? e : e.address).toLowerCase() === walletAddress.toLowerCase()
-      );
-      eligible = found;
-      reason = found ? "Found in allowlist" : "Not in allowlist";
-    } else {
-      eligible = null;
-      reason = "Allowlist not exposed via API";
-    }
+  let slug;
+  try { slug = extractSlug(inputUrl); }
+  catch (e) { console.error(`[!] ${e.message}`); process.exit(1); }
 
-    return {
-      phaseIndex: i + 1,
-      phaseName: stage.name ?? `Stage ${i + 1}`,
-      status,
-      price: formatPrice(stage.price),
-      limit: stage.max_per_wallet ? `${stage.max_per_wallet}/wallet` : "Unlimited",
-      startTime: stage.start_time,
-      eligible,
-      reason,
-    };
-  });
-}
+  console.log(`\n[@] Fetching drop: ${slug} ...`);
 
-// ─── Print all results ───────────────────────────────────────────────────────
-function printResults(drop, wallets, allResults, inputUrl) {
+  let drop;
+  try { drop = await fetchDrop(slug, env.apiKey); }
+  catch (e) { console.error(`[!] ${e.message}`); process.exit(1); }
+
+  const stages = drop.stages ?? [];
   const remaining = (drop.total_supply ?? 0) - (drop.total_minted ?? 0);
-  const LINE = "═".repeat(60);
-  const line = "─".repeat(58);
 
+  // ── Info drop ──
   console.log(`\n${LINE}`);
-  console.log(`📦  ${drop.name ?? "Unknown Collection"}`);
-  console.log(`⛓️   Chain  : ${drop.chain ?? "N/A"}`);
-  console.log(`🎨  Supply : ${drop.total_supply ?? "?"} total | ${drop.total_minted ?? 0} minted | ${remaining} remaining`);
+  console.log(`[+] ${drop.name ?? slug}`);
+  console.log(`[@] Chain  : ${drop.chain ?? env.chain}`);
+  console.log(`[@] Supply : ${drop.total_supply ?? "?"} total | ${drop.total_minted ?? 0} minted | ${remaining} remaining`);
   console.log(LINE);
 
-  // Phase schedule (shown once)
-  const stages = drop.stages ?? [];
+  // ── Mint schedule ──
   if (stages.length === 0) {
-    console.log("\n⚠️  No mint stages found for this drop.");
+    console.log("[!] Tidak ada mint stage ditemukan.");
   } else {
-    console.log(`\n📋 MINT SCHEDULE (${stages.length} phase${stages.length !== 1 ? "s" : ""})\n`);
-    stages.forEach((stage, i) => {
-      const status = stageStatus(stage);
-      const icon = status === "ACTIVE" ? "🟢" : status === "UPCOMING" ? "🟡" : "🔴";
-      const startStr = stage.start_time
-        ? `${formatDate(stage.start_time)}${status === "UPCOMING" ? ` (in ${countdown(stage.start_time)})` : ""}`
+    console.log(`\n[+] MINT SCHEDULE (${stages.length} phase)\n`);
+    stages.forEach((s, i) => {
+      const status = stageStatus(s);
+      const icon = status === "ACTIVE" ? "[LIVE]" : status === "UPCOMING" ? "[SOON]" : "[END] ";
+      const startStr = s.start_time
+        ? `${formatDate(s.start_time)}${status === "UPCOMING" ? ` (in ${countdown(s.start_time)})` : ""}`
         : "TBA";
-      console.log(`  [${i + 1}] ${stage.name ?? `Stage ${i + 1}`}  ${icon} ${status}`);
-      console.log(`       Price  : ${formatPrice(stage.price)}`);
-      console.log(`       Limit  : ${stage.max_per_wallet ? `${stage.max_per_wallet}/wallet` : "Unlimited"}`);
-      console.log(`       Starts : ${startStr}`);
-      console.log(`       Ends   : ${stage.end_time ? formatDate(stage.end_time) : "Until sold out"}`);
+      console.log(`  ${icon} ${s.name ?? `Phase ${i + 1}`}`);
+      console.log(`         Price  : ${formatPrice(s.price)}`);
+      console.log(`         Limit  : ${s.max_per_wallet ? `${s.max_per_wallet}/wallet` : "Unlimited"}`);
+      console.log(`         Starts : ${startStr}`);
+      console.log(`         Ends   : ${s.end_time ? formatDate(s.end_time) : "Until sold out"}`);
       console.log();
     });
   }
 
-  // Per-wallet eligibility
+  // ── Cek tiap wallet ──
   console.log(LINE);
-  console.log(`🎯  ELIGIBILITY — ${wallets.length} wallet${wallets.length !== 1 ? "s" : ""}`);
+  console.log(`[+] CEK ELIGIBILITY — ${env.privateKeys.length} wallet`);
   console.log(LINE);
 
-  wallets.forEach((wallet, wi) => {
-    const results = allResults[wi];
-    const eligible = results.filter((r) => r.eligible === true);
-    const unknown = results.filter((r) => r.eligible === null);
-
-    console.log(`\n  👛 Wallet ${wi + 1}: ${wallet}`);
-    console.log(`  ${line}`);
-
-    results.forEach((r) => {
-      const icon = r.eligible === true ? "✅" : r.eligible === false ? "❌" : "⚠️ ";
-      console.log(`  Phase ${r.phaseIndex} "${r.phaseName}"  →  ${icon}  ${r.reason}`);
-    });
-
-    if (eligible.length > 0) {
-      const names = eligible.map((r) => `Phase ${r.phaseIndex} (${r.phaseName})`).join(", ");
-      console.log(`\n  🎉 ELIGIBLE for: ${names}`);
-    } else if (unknown.length > 0 && eligible.length === 0) {
-      console.log(`\n  ⚠️  ${unknown.length} phase(s) unverifiable via API — connect wallet on OpenSea`);
-    } else {
-      console.log(`\n  ❌ NOT eligible for any phase`);
+  for (const { label, key: privKey } of env.privateKeys) {
+    let walletAddress;
+    try {
+      walletAddress = await getAddress(privKey);
+    } catch (e) {
+      console.log(`\n[!] ${label}: Gagal derive address — install ethers dulu: npm install ethers`);
+      continue;
     }
-  });
 
-  console.log(`\n  🔗 ${inputUrl.replace("/overview", "")}`);
-  console.log(`\n${LINE}\n`);
-}
+    console.log(`\n[@] ${label} | ${walletAddress}`);
 
-// ─── Main ────────────────────────────────────────────────────────────────────
-async function main() {
-  const env = loadEnv();
+    // Sign + get token
+    let token = null;
+    try {
+      process.stdout.write(`    [~] Signing ...`);
+      token = await signAndGetToken(privKey, walletAddress, env.apiKey);
+      process.stdout.write(`\r    [+] Signing OK\n`);
+    } catch (e) {
+      process.stdout.write(`\r    [!] Signing gagal: ${e.message}\n`);
+    }
 
-  const args = process.argv.slice(2);
-  if (args.length < 1) {
-    console.error("\nUsage: node opensea-eligibility-checker.js <opensea_url>\n");
-    console.error("Isi .env dengan:");
-    console.error("  OPENSEA_API_KEY=your_key_here  <- opsional\n");
-    console.error("  0xWallet1");
-    console.error("  0xWallet2\n");
-    process.exit(1);
+    // Cek eligibility dengan token
+    let eligData = null;
+    if (token) {
+      try {
+        eligData = await checkEligibilityAuth(slug, walletAddress, token, env.apiKey);
+      } catch { /* fallback */ }
+    }
+
+    if (eligData?.stages && eligData.stages.length > 0) {
+      eligData.stages.forEach((es, i) => {
+        const stageName = stages[i]?.name ?? es.stage_name ?? `Phase ${i + 1}`;
+        const eligible = es.eligible ?? es.is_eligible;
+        const icon = eligible ? "[+]" : "[-]";
+        const reason = es.reason ?? (eligible ? "Eligible" : "Not eligible");
+        console.log(`    ${icon} ${stageName}: ${reason}`);
+      });
+    } else {
+      // Fallback: cek allowlist dari drop data
+      stages.forEach((s) => {
+        const stageName = s.name ?? "Unknown Phase";
+        const allowlist = s.allowlist ?? s.allow_list ?? [];
+        let icon, reason;
+
+        if (s.is_public) {
+          icon = "[+]"; reason = "Public phase";
+        } else if (allowlist.length > 0) {
+          const found = allowlist.some(
+            (e) => (typeof e === "string" ? e : e.address).toLowerCase() === walletAddress.toLowerCase()
+          );
+          icon = found ? "[+]" : "[-]";
+          reason = found ? "Eligible" : "Not eligible";
+        } else {
+          icon = "[?]"; reason = "Allowlist tidak di-expose API";
+        }
+        console.log(`    ${icon} ${stageName}: ${reason}`);
+      });
+    }
   }
 
-  const inputUrl = args[0];
-  const apiKey = env.apiKey;
-  const wallets = env.wallets;
-
-  if (wallets.length === 0) {
-    console.error("❌ Tidak ada wallet di .env. Tambahkan address per baris:\n  0xWallet1\n  0xWallet2");
-    process.exit(1);
-  }
-
-  let slug;
-  try {
-    slug = extractSlug(inputUrl);
-  } catch (e) {
-    console.error(`❌ ${e.message}`);
-    process.exit(1);
-  }
-
-  console.log(`\n🔍 Fetching drop: ${slug} ...`);
-  if (!apiKey) console.log("ℹ️  Tanpa API key — kemungkinan rate limited");
-
-  let drop;
-  try {
-    drop = await fetchDrop(slug, apiKey);
-  } catch (e) {
-    console.error(`\n❌ ${e.message}`);
-    console.error("💡 Dapetin API key gratis: https://docs.opensea.io/reference/api-keys");
-    process.exit(1);
-  }
-
-  const stages = drop.stages ?? [];
-  const allResults = wallets.map((w) => checkWalletEligibility(w, stages));
-  printResults(drop, wallets, allResults, inputUrl);
+  console.log(`\n[@] ${inputUrl.replace("/overview", "")}`);
+  console.log(`${LINE}\n`);
 }
 
 main().catch((e) => {
-  console.error("Fatal error:", e.message);
+  console.error("[!] Fatal:", e.message);
   process.exit(1);
 });
